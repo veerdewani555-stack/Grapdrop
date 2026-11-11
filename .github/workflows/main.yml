@@ -2,9 +2,6 @@ name: Build APK
 on:
   push:
   workflow_dispatch:
-defaults:
-  run:
-    working-directory: GrabDrop   # <- your folder name
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -17,13 +14,24 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
+      - name: Find the project
+        id: p
+        run: |
+          F=$(find . -name settings.gradle.kts | head -n 1)
+          if [ -z "$F" ]; then
+            echo "PROJECT FILES NOT FOUND. Your repository contains:"
+            find . -not -path "./.git/*" | head -60
+            exit 1
+          fi
+          echo "dir=$(dirname "$F")" >> $GITHUB_OUTPUT
       - name: Download hand model
         run: |
-          mkdir -p app/src/main/assets
-          curl -L -o app/src/main/assets/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+          mkdir -p "${{ steps.p.outputs.dir }}/app/src/main/assets"
+          curl -L -o "${{ steps.p.outputs.dir }}/app/src/main/assets/hand_landmarker.task" https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
       - name: Build debug APK
+        working-directory: ${{ steps.p.outputs.dir }}
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: GrabDrop-apk
-          path: GrabDrop/app/build/outputs/apk/debug/app-debug.apk   # <- your folder name
+          path: ${{ steps.p.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk

@@ -17,8 +17,28 @@ import kotlin.concurrent.thread
 /** Shared between the activity (Share target) and the service. */
 object Carry { @Volatile var shared: File? = null }
 
+/** Live info shown on the app screen so we can see what the camera sees. */
+object Debug {
+    @Volatile var running = false
+    @Volatile var frames = 0
+    @Volatile var hand = "-"
+    @Volatile var error = ""
+}
+
 class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
+    private lateinit var info: TextView
+    private val h = android.os.Handler(android.os.Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            info.text = "Service: " + (if (Debug.running) "running" else "off") +
+                "\nCamera frames: " + Debug.frames + "\nHand seen: " + Debug.hand +
+                (if (Debug.error.isNotEmpty()) "\nERROR: " + Debug.error else "")
+            h.postDelayed(this, 400)
+        }
+    }
+    override fun onResume() { super.onResume(); h.post(tick) }
+    override fun onPause() { super.onPause(); h.removeCallbacks(tick) }
 
     private val askPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
         if (r[Manifest.permission.CAMERA] == true) {
@@ -35,10 +55,15 @@ class MainActivity : ComponentActivity() {
             text = "Stop"
             setOnClickListener { stopService(Intent(this@MainActivity, GestureService::class.java)); status.text = "Stopped." }
         }
+        info = TextView(this).apply { textSize = 15f; setPadding(0, 40, 0, 0) }
+        val test = Button(this).apply {
+            text = "Test grab (no gesture)"
+            setOnClickListener { ContextCompat.startForegroundService(this@MainActivity, Intent(this@MainActivity, GestureService::class.java).setAction("GRAB")) }
+        }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48)
             addView(TextView(this@MainActivity).apply { text = "✋ Grab & Drop"; textSize = 26f })
-            addView(status); addView(start); addView(stop)
+            addView(status); addView(start); addView(test); addView(stop); addView(info)
         })
         handleShare(intent)
     }

@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Notification
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -56,17 +57,24 @@ class GestureService : LifecycleService() {
         if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
         else startForeground(1, n)
 
-        landmarker = HandLandmarker.createFromOptions(this, HandLandmarker.HandLandmarkerOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-            .setRunningMode(RunningMode.IMAGE).setNumHands(1).build())
+        Debug.running = true; Debug.error = ""; Debug.frames = 0
+        try {
+            landmarker = HandLandmarker.createFromOptions(this, HandLandmarker.HandLandmarkerOptions.builder()
+                .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
+                .setRunningMode(RunningMode.IMAGE).setNumHands(1).build())
+        } catch (e: Throwable) {
+            Debug.error = "Hand model failed to load: " + e.message; setNote("Hand model failed to load"); return
+        }
 
         val f = ProcessCameraProvider.getInstance(this)
         f.addListener({
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
             analysis.setAnalyzer(exec) { analyze(it) }
-            f.get().unbindAll()
-            f.get().bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+            try {
+                f.get().unbindAll()
+                f.get().bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+            } catch (e: Throwable) { Debug.error = "Camera failed: " + e.message }
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -81,14 +89,15 @@ class GestureService : LifecycleService() {
     private fun analyze(p: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastFrame < 100) { p.close(); return }   // ~10 fps is plenty
-        lastFrame = now
+        lastFrame = now; Debug.frames++
         try {
             val m = Matrix().apply { postRotate(p.imageInfo.rotationDegrees.toFloat()) }
             val raw = p.toBitmap()
             val bmp = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
             val g = landmarker.detect(BitmapImageBuilder(bmp).build()).landmarks().firstOrNull()?.let { classify(it) }
+            Debug.hand = g ?: "no hand"
             onPose(g, now)
-        } catch (_: Exception) {
+        } catch (e: Throwable) { Debug.error = e.toString()
         } finally { p.close() }
         if (server != null && now > carryUntil) stopCarry()
     }
@@ -153,7 +162,17 @@ class GestureService : LifecycleService() {
         v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 80, 40, 80), -1))
     }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        if (intent?.action == "GRAB") {
+            try { if (server == null) grab(SystemClock.elapsedRealtime()) }
+            catch (e: Throwable) { Debug.error = "Grab failed: " + e.message }
+        }
+        return START_STICKY
+    }
+
     override fun onDestroy() {
-        stopCarry(); landmarker.close(); exec.shutdown(); super.onDestroy()
+        Debug.running = false
+        stopCarry(); if (::landmarker.isInitialized) landmarker.close(); exec.shutdown(); super.onDestroy()
     }
 }

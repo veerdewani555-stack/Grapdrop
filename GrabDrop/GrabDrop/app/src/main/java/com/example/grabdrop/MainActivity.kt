@@ -86,6 +86,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var holdText: TextView
     private lateinit var logView: TextView
     private lateinit var badge: TextView
+    private lateinit var codeView: TextView
     private lateinit var bar: ProgressBar
     private lateinit var preview: PreviewView
     private lateinit var keep: CheckBox
@@ -157,17 +158,19 @@ class MainActivity : ComponentActivity() {
 
         // ---- Connection card ----
         val c1 = card("Connection")
-        status = text("Looking for your laptop on Wi-Fi…", 15f, cText, true)
+        status = text("Ready. Choose files, then make a fist to grab.", 15f, cText, true)
         c1.put(status)
-        c1.put(text("No code needed. Run receiver.py on your laptop (same Wi-Fi) and it finds this phone by itself.", 13f, cMuted))
+        c1.put(text("Run receiver.py on your laptop (same Wi-Fi). It should find this phone by itself. If it does not, type the code that appears here while you are carrying.", 13f, cMuted))
         c1.put(text("This phone: GrabDrop-" + Build.MODEL, 13f, cMuted), 4)
+        codeView = text("", 16f, cAccent, true).apply { visibility = View.GONE; setTextIsSelectable(true) }
+        c1.put(codeView, 8)
 
         // ---- Files card ----
         val c2 = card("Files")
         val row = LinearLayout(this)
         fun addBtn(t: String, filled: Boolean, f: () -> Unit) =
             row.addView(button(t, filled, f), LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = px(6) })
-        addBtn("📁 Choose files", true) { picker.launch("*/*") }
+        addBtn("📁 Choose", true) { picker.launch("*/*") }
         addBtn("Grab", false) { grab() }
         addBtn("Cancel", false) { stopCarry("Cancelled") }
         c2.put(row)
@@ -251,6 +254,11 @@ class MainActivity : ComponentActivity() {
         while (lines.size > 8) lines.removeLast()
         logView.text = lines.joinToString("\n")
     }
+
+    private fun localIp(): String? = try {
+        java.net.NetworkInterface.getNetworkInterfaces().toList().flatMap { it.inetAddresses.toList() }
+            .firstOrNull { !it.isLoopbackAddress && it is java.net.Inet4Address && it.isSiteLocalAddress }?.hostAddress
+    } catch (_: Exception) { null }
 
     private fun updateBadge() {
         badge.visibility = if (carrying != null) View.VISIBLE else View.GONE
@@ -375,8 +383,8 @@ class MainActivity : ComponentActivity() {
                 setAttribute("n", (list[0].second + if (list.size > 1) " +" + (list.size - 1) else "").take(60))
             }
             val l = object : NsdManager.RegistrationListener {
-                override fun onServiceRegistered(i: NsdServiceInfo) {}
-                override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) {}
+                override fun onServiceRegistered(i: NsdServiceInfo) { runOnUiThread { say("Announced on Wi-Fi as " + i.serviceName, false) } }
+                override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) { runOnUiThread { say("Wi-Fi announce failed (code $e). Use the code below.") } }
                 override fun onServiceUnregistered(i: NsdServiceInfo) {}
                 override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
             }
@@ -385,6 +393,8 @@ class MainActivity : ComponentActivity() {
             val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 80, 40, 80), -1))
             bar.progress = 0; bar.visibility = View.VISIBLE; updateBadge()
+            codeView.text = "Laptop code:  " + (localIp() ?: "?") + ":" + srv.port + "/" + token
+            codeView.visibility = View.VISIBLE
             say("✊ Carrying ${list.size} file(s). Drop on your laptop.")
         } catch (e: Throwable) { stopCarry("Grab failed: ${e.message}") }
     }
@@ -394,7 +404,7 @@ class MainActivity : ComponentActivity() {
         try { regListener?.let { (getSystemService(Context.NSD_SERVICE) as NsdManager).unregisterService(it) } } catch (_: Exception) {}
         regListener = null; server?.stop(); server = null; carrying = null
         if (remove && c != null && !keep.isChecked) { items.removeAll(c); renderList() }
-        bar.visibility = View.GONE; updateBadge()
+        bar.visibility = View.GONE; codeView.visibility = View.GONE; updateBadge()
         say(msg)
     }
 

@@ -1,378 +1,208 @@
 package com.example.grabdrop
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.ContentValues
-import android.content.Context
+import android.Manifest
 import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.Matrix
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
-import android.os.Environment
-import android.os.Handler
-import android.os.Looper
-import android.os.SystemClock
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.provider.MediaStore
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.LifecycleService
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import java.io.File
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.util.UUID
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
-import kotlin.math.hypot
 
-/**
- * Owns the camera, gesture detection, sending (phone -> laptop) and receiving (laptop -> phone).
- * Runs as a camera foreground service, so it keeps working with the app in the background.
- * NOTE: Android 11+ only lets a camera service START while the app is visible (the Start button does that).
- */
-class GestureService : LifecycleService() {
-    companion object {
-        const val GRAB = "grab"; const val CANCEL = "cancel"; const val FETCH = "fetch"; const val STOP = "stop"
-        const val OPEN_MIN = 1.55; const val FIST_MAX = 1.30
-        const val WINDOW_MS = 5000L; const val CARRY_MS = 60_000L
-        const val CH_RUN = "run"; const val CH_ASK = "ask"
-        const val SVC_PHONE = "_grabdrop._tcp."
-        const val SVC_PC = "_grabdrop-pc._tcp."
-        fun start(c: Context) = ContextCompat.startForegroundService(c, Intent(c, GestureService::class.java))
-        fun stop(c: Context) { c.stopService(Intent(c, GestureService::class.java)) }
+/** UI only. Camera, gestures and transfers live in GestureService; shared state lives in Hub. */
+class MainActivity : ComponentActivity() {
+    private lateinit var status: TextView
+    private lateinit var handLabel: TextView
+    private lateinit var fileList: TextView
+    private lateinit var logView: TextView
+    private lateinit var badge: TextView
+    private lateinit var codeView: TextView
+    private lateinit var bar: ProgressBar
+    private lateinit var toggle: Button
+    private lateinit var receiveBtn: Button
+
+    private val picker = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        uris.forEach { Hub.items.add(it to nameOf(it)) }
+        if (uris.isNotEmpty()) Hub.say("${Hub.items.size} file(s) ready. Open palm → fist to grab.") else refresh()
+    }
+    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        if (granted(Manifest.permission.CAMERA)) GestureService.start(this) else Hub.say("Camera permission is needed")
     }
 
-    private data class Remote(val host: String, val port: Int, val token: String, val label: String)
+    private fun granted(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
 
-    private val main = Handler(Looper.getMainLooper())
-    private val exec = Executors.newSingleThreadExecutor()
-    private val nsd by lazy { getSystemService(Context.NSD_SERVICE) as NsdManager }
-    private var landmarker: HandLandmarker? = null
-    private var started = false
+    private fun startWatching() {
+        val need = mutableListOf<String>()
+        if (!granted(Manifest.permission.CAMERA)) need.add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) need.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (need.isEmpty()) GestureService.start(this) else perms.launch(need.toTypedArray())
+    }
 
-    // gesture state (analysis thread only)
-    private var lastFrame = 0L
-    private var candidate: String? = null
-    private var since = 0L
-    private var confirmed: String? = null
-    private var lastOpen = 0L
-    private var lastFist = 0L
+    private fun cmd(action: String) {
+        if (!Hub.running) { Hub.say("Tap Start watching first"); return }
+        startService(Intent(this, GestureService::class.java).setAction(action))
+    }
 
-    // sending
-    private var server: MultiServer? = null
-    private var regListener: NsdManager.RegistrationListener? = null
-    @Volatile private var ownName = ""   // our own announced name, so we never 'receive' from ourselves
-    @Volatile private var carryUntil = 0L
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val dp = resources.displayMetrics.density
+        fun px(v: Int) = (v * dp).toInt()
 
-    // receiving
-    private val discoveries = mutableListOf<NsdManager.DiscoveryListener>()
-    private val remotes = ConcurrentHashMap<String, Remote>()
-    private val pending = ArrayDeque<NsdServiceInfo>()
-    private var resolving = false
-    @Volatile private var fetching = false
+        val dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val cBg = Color.parseColor(if (dark) "#14161A" else "#F6F7F9")
+        val cCard = Color.parseColor(if (dark) "#1E2127" else "#FFFFFF")
+        val cText = Color.parseColor(if (dark) "#ECEEF1" else "#1A1D21")
+        val cMuted = Color.parseColor(if (dark) "#9AA1AD" else "#6B7280")
+        val cAccent = Color.parseColor(if (dark) "#818CF8" else "#4F46E5")
+        val cOk = Color.parseColor(if (dark) "#4ADE80" else "#16A34A")
+        window.decorView.setBackgroundColor(cBg)
+        @Suppress("DEPRECATION") run { window.statusBarColor = cBg }
 
-    override fun onCreate() { super.onCreate(); Hub.running = true }
-
-    override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
-        super.onStartCommand(i, flags, startId)
-        when (i?.action) {
-            STOP -> { stopSelf(); return START_NOT_STICKY }
-            GRAB -> if (started) grab() else stopSelf()
-            CANCEL -> if (started) stopCarry("Cancelled") else stopSelf()
-            FETCH -> if (started) fetch() else stopSelf()
-            else -> if (!started) {
-                started = true
-                try { goForeground() } catch (e: Exception) { fail("Could not start camera service: ${e.message}"); return START_NOT_STICKY }
-                initAndStart()
-            }
+        fun text(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+            text = t; textSize = size; setTextColor(color); if (bold) setTypeface(Typeface.DEFAULT_BOLD)
         }
-        return START_NOT_STICKY
-    }
-
-    private fun goForeground() {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CH_RUN, "Gesture watching", NotificationManager.IMPORTANCE_LOW))
-        nm.createNotificationChannel(NotificationChannel(CH_ASK, "Transfer requests", NotificationManager.IMPORTANCE_HIGH))
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val stop = PendingIntent.getService(this, 1, Intent(this, GestureService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE)
-        val n = NotificationCompat.Builder(this, CH_RUN).setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("Grab & Drop is watching for gestures").setContentIntent(open)
-            .addAction(0, "Stop", stop).setOngoing(true).build()
-        if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
-        else startForeground(1, n)
-    }
-
-    private fun fail(msg: String) { Hub.say(msg); stopSelf() }
-
-    // ---------- camera + hand detection ----------
-    private fun initAndStart() {
-        Hub.handText = "loading hand model…"; Hub.onChange?.invoke()
-        thread {
-            try {
-                landmarker = HandLandmarker.createFromOptions(this, HandLandmarker.HandLandmarkerOptions.builder()
-                    .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
-                    .setRunningMode(RunningMode.VIDEO).setNumHands(1)
-                    .setMinHandDetectionConfidence(0.3f).setMinHandPresenceConfidence(0.3f)
-                    .setMinTrackingConfidence(0.3f).build())
-                main.post { startCamera() }
-            } catch (e: Throwable) { main.post { fail("Hand model failed: ${e.message}") } }
-        }
-    }
-
-    private fun startCamera() {
-        val fut = ProcessCameraProvider.getInstance(this)
-        fut.addListener({
-            try {
-                val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
-                analysis.setAnalyzer(exec) { analyze(it) }
-                fut.get().apply { unbindAll(); bindToLifecycle(this@GestureService, CameraSelector.DEFAULT_FRONT_CAMERA, analysis) }
-                Hub.handText = "show your hand"; Hub.say("Watching for gestures", false)
-                startDiscovery()
-            } catch (e: Throwable) { fail("Camera error: ${e.message}") }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun score(lm: List<NormalizedLandmark>, w: Int, h: Int): Double {
-        fun d(a: Int, b: Int) = hypot((lm[a].x() - lm[b].x()) * w.toDouble(), (lm[a].y() - lm[b].y()) * h.toDouble())
-        val palm = d(0, 9).coerceAtLeast(1e-6)
-        return listOf(8, 12, 16, 20).map { d(it, 0) / palm }.average()
-    }
-
-    private fun analyze(p: ImageProxy) {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastFrame < 80) { p.close(); return }
-        lastFrame = now
-        try {
-            val lm = landmarker ?: return
-            val raw = p.toBitmap()
-            val bmp = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height,
-                Matrix().apply { postRotate(p.imageInfo.rotationDegrees.toFloat()) }, true)
-            val hand = lm.detectForVideo(BitmapImageBuilder(bmp).build(), SystemClock.uptimeMillis()).landmarks().firstOrNull()
-            var g: String? = null
-            if (hand == null) Hub.handText = "no hand"
-            else {
-                val s = score(hand, bmp.width, bmp.height)
-                g = if (s > OPEN_MIN) "open" else if (s < FIST_MAX) "fist" else null
-                Hub.handText = (if (g == "open") "🖐 open" else if (g == "fist") "✊ fist" else "hand (unsure)") + "  %.2f".format(s)
+        fun button(t: String, filled: Boolean, f: () -> Unit) = Button(this).apply {
+            text = t; isAllCaps = false; textSize = 14f; stateListAnimator = null
+            setTextColor(if (filled) Color.WHITE else cAccent)
+            background = GradientDrawable().apply {
+                cornerRadius = px(10).toFloat()
+                if (filled) setColor(cAccent) else { setColor(Color.TRANSPARENT); setStroke(px(1), cAccent) }
             }
-            onPose(g, now)
-            Hub.onChange?.invoke()
-        } catch (e: Throwable) { Hub.handText = "Error: $e" } finally { p.close() }
-    }
-
-    private fun onPose(g: String?, now: Long) {
-        if (g != candidate) { candidate = g; since = now }
-        if (candidate != null && now - since >= Hub.holdMs && candidate != confirmed) {
-            confirmed = candidate
-            // phone -> laptop: open palm, then fist
-            if (confirmed == "fist" && now - lastOpen < WINDOW_MS && Hub.carrying == null && Hub.items.isNotEmpty()) main.post { grab() }
-            // laptop -> phone: fist, then open palm
-            if (confirmed == "open" && now - lastFist < WINDOW_MS && Hub.carrying == null && remotes.isNotEmpty()) main.post { fetch() }
+            setOnClickListener { f() }
         }
-        if (candidate == null && now - since > 1500) confirmed = null
-        if (confirmed == "open") lastOpen = now
-        if (confirmed == "fist") lastFist = now
-        if (Hub.carrying != null && now > carryUntil) main.post { stopCarry("Time ran out") }
-    }
+        fun LinearLayout.put(v: View, top: Int = 8) = addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(top) })
 
-    // ---------- phone -> laptop ----------
-    private fun grab() {
-        if (Hub.carrying != null) return
-        val list = Hub.items.toList()
-        if (list.isEmpty()) { Hub.say("Choose files first"); return }
-        val token = UUID.randomUUID().toString().take(8)
-        try {
-            val srv = MultiServer(contentResolver, list, token, this::ask,
-                { done, total -> Hub.progress = done * 100 / total; Hub.onChange?.invoke() }) {
-                main.post { stopCarry("✅ Sent ${list.size} file(s)", true) }
-            }
-            srv.start()
-            server = srv; Hub.carrying = list; carryUntil = SystemClock.elapsedRealtime() + CARRY_MS
-            val svc = NsdServiceInfo().apply {
-                ownName = "GrabDrop-" + Build.MODEL + "-" + token.take(4); serviceName = ownName; serviceType = SVC_PHONE; port = srv.port
-                setAttribute("t", token)
-                setAttribute("n", (list[0].second + if (list.size > 1) " +" + (list.size - 1) else "").take(60))
-            }
-            val l = object : NsdManager.RegistrationListener {
-                override fun onServiceRegistered(i: NsdServiceInfo) { Hub.say("Announced on Wi-Fi as " + i.serviceName, false) }
-                override fun onRegistrationFailed(i: NsdServiceInfo, e: Int) { Hub.say("Wi-Fi announce failed (code $e). Use the code below.") }
-                override fun onServiceUnregistered(i: NsdServiceInfo) {}
-                override fun onUnregistrationFailed(i: NsdServiceInfo, e: Int) {}
-            }
-            regListener = l
-            nsd.registerService(svc, NsdManager.PROTOCOL_DNS_SD, l)
-            vibrate()
-            Hub.progress = 0
-            Hub.codeText = "Laptop code:  " + (localIp() ?: "?") + ":" + srv.port + "/" + token
-            Hub.say("✊ Carrying ${list.size} file(s). Drop on your laptop.")
-        } catch (e: Throwable) { stopCarry("Grab failed: ${e.message}") }
-    }
-
-    private fun stopCarry(msg: String, remove: Boolean = false) {
-        val c = Hub.carrying
-        try { regListener?.let { nsd.unregisterService(it) } } catch (_: Exception) {}
-        regListener = null; server?.stop(); server = null; Hub.carrying = null
-        if (remove && c != null && !Hub.keepCopy) Hub.items.removeAll(c)
-        Hub.progress = -1; Hub.codeText = ""
-        Hub.say(msg)
-    }
-
-    /** Called from the server thread for each new device. Shows Allow/Deny on a notification; denies on timeout. */
-    private fun ask(ip: String, device: String): Boolean {
-        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
-            Hub.say("Blocked $device: turn on notifications so you can approve transfers"); return false
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(40), px(16), px(90)) }
+        fun card(title: String): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply { setColor(cCard); cornerRadius = px(14).toFloat() }
+            elevation = px(2).toFloat(); setPadding(px(14), px(14), px(14), px(14))
+            addView(text(title, 16f, cText, true))
+            content.addView(this, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = px(12) })
         }
-        val id = UUID.randomUUID().toString()
-        val yes = "com.example.grabdrop.Y$id"; val no = "com.example.grabdrop.N$id"
-        val latch = CountDownLatch(1); val ok = AtomicBoolean(false)
-        val rcv = object : BroadcastReceiver() {
-            override fun onReceive(c: Context, i: Intent) { ok.set(i.action == yes); latch.countDown() }
+
+        content.addView(text("✋ Grab & Drop", 22f, cText, true))
+
+        // Connection
+        val c1 = card("Connection")
+        status = text("", 15f, cText, true); c1.put(status)
+        c1.put(text("Phone → laptop: open palm, then fist. Laptop → phone: copy files on the laptop, fist there, then fist → open palm here. Every transfer needs your approval.", 13f, cMuted))
+        codeView = text("", 16f, cAccent, true).apply { visibility = View.GONE; setTextIsSelectable(true) }
+        c1.put(codeView)
+        toggle = button("Start watching", true) { if (Hub.running) GestureService.stop(this) else startWatching() }
+        c1.put(toggle, 10)
+
+        // Files
+        val c2 = card("Files")
+        val row = LinearLayout(this)
+        fun addBtn(t: String, filled: Boolean, f: () -> Unit) =
+            button(t, filled, f).also { row.addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = px(6) }) }
+        addBtn("📁 Choose", true) { picker.launch("*/*") }
+        addBtn("Grab", false) { cmd(GestureService.GRAB) }
+        addBtn("Cancel", false) { cmd(GestureService.CANCEL) }
+        receiveBtn = addBtn("Receive", false) { cmd(GestureService.FETCH) }
+        c2.put(row)
+        fileList = text("", 14f, cText); c2.put(fileList)
+        c2.put(CheckBox(this).apply {
+            text = "Keep a copy after sending"; setTextColor(cMuted); buttonTintList = ColorStateList.valueOf(cAccent)
+            setOnCheckedChangeListener { _, v -> Hub.keepCopy = v }
+        }, 4)
+        bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; visibility = View.GONE; progressTintList = ColorStateList.valueOf(cOk)
         }
-        ContextCompat.registerReceiver(this, rcv, IntentFilter().apply { addAction(yes); addAction(no) }, ContextCompat.RECEIVER_NOT_EXPORTED)
-        fun pi(a: String) = PendingIntent.getBroadcast(this, 0, Intent(a).setPackage(packageName), PendingIntent.FLAG_IMMUTABLE)
-        val nid = 1000 + (id.hashCode() and 0xFFFF)
-        val n = NotificationCompat.Builder(this, CH_ASK).setSmallIcon(android.R.drawable.ic_menu_share)
-            .setContentTitle("Allow \"$device\" to take your files?").setContentText("Request from $ip. Only allow your own device.")
-            .setPriority(NotificationCompat.PRIORITY_HIGH).setCategory(NotificationCompat.CATEGORY_CALL)
-            .addAction(0, "Allow", pi(yes)).addAction(0, "Deny", pi(no)).setTimeoutAfter(20_000).build()
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(nid, n); vibrate()
-        Hub.say("🔐 $device ($ip) is asking to receive. Approve it in the notification.")
-        val answered = latch.await(20, TimeUnit.SECONDS)
-        try { unregisterReceiver(rcv) } catch (_: Exception) {}
-        nm.cancel(nid)
-        val allowed = answered && ok.get()
-        Hub.say(if (allowed) "Allowed $device" else "Denied $device")
-        return allowed
-    }
+        c2.put(bar)
 
-    // ---------- laptop -> phone ----------
-    // Look for laptops (_grabdrop-pc) AND other phones (_grabdrop)
-    private fun startDiscovery() { discover(SVC_PC); discover(SVC_PHONE) }
-
-    private fun discover(type: String) {
-        val l = object : NsdManager.DiscoveryListener {
-            override fun onServiceFound(s: NsdServiceInfo) { if (s.serviceName != ownName) enqueue(s) }
-            override fun onServiceLost(s: NsdServiceInfo) {
-                remotes.remove(s.serviceName); Hub.remoteName = remotes.values.firstOrNull()?.label; Hub.onChange?.invoke()
-            }
-            override fun onDiscoveryStarted(t: String) {}
-            override fun onDiscoveryStopped(t: String) {}
-            override fun onStartDiscoveryFailed(t: String, e: Int) { Hub.say("Laptop discovery failed (code $e)") }
-            override fun onStopDiscoveryFailed(t: String, e: Int) {}
-        }
-        discoveries.add(l)
-        nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l)
-    }
-
-    // NsdManager resolves one service at a time, so queue them
-    private fun enqueue(s: NsdServiceInfo) = synchronized(pending) { pending.addLast(s); resolveNext() }
-
-    @Suppress("DEPRECATION")
-    private fun resolveNext() {
-        if (resolving) return
-        val s = pending.removeFirstOrNull() ?: return
-        resolving = true
-        nsd.resolveService(s, object : NsdManager.ResolveListener {
-            override fun onResolveFailed(i: NsdServiceInfo, e: Int) { synchronized(pending) { resolving = false; resolveNext() } }
-            override fun onServiceResolved(i: NsdServiceInfo) {
-                val tok = i.attributes["t"]?.let { String(it) }
-                val label = i.attributes["n"]?.let { String(it) } ?: "files"
-                val host = i.host?.hostAddress
-                if (tok != null && host != null && i.serviceName != ownName) {
-                    remotes[i.serviceName] = Remote(host, i.port, tok, label)
-                    Hub.remoteName = label
-                    Hub.say("📲 ${i.serviceName.removePrefix("GrabDrop-")} is carrying: $label. Fist → open palm, or tap Receive.")
+        // Gestures
+        val c3 = card("Hand gestures")
+        handLabel = text("", 16f, cText, true); c3.put(handLabel)
+        val holdText = text("Hold time: 0.5 s", 13f, cMuted); c3.put(holdText)
+        c3.put(SeekBar(this).apply {
+            max = 13; progress = 3
+            progressTintList = ColorStateList.valueOf(cAccent); thumbTintList = ColorStateList.valueOf(cAccent)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                    Hub.holdMs = 200L + p * 100L; holdText.text = "Hold time: ${Hub.holdMs / 1000.0} s"
                 }
-                synchronized(pending) { resolving = false; resolveNext() }
-            }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }, 0)
+
+        // Activity
+        val c4 = card("Activity")
+        logView = text("", 13f, cMuted); c4.put(logView)
+
+        badge = text("", 15f, Color.WHITE, true).apply {
+            setPadding(px(16), px(8), px(16), px(8)); visibility = View.GONE
+            background = GradientDrawable().apply { setColor(cOk); cornerRadius = px(20).toFloat() }
+        }
+        setContentView(FrameLayout(this).apply {
+            addView(ScrollView(this@MainActivity).apply { addView(content) }, FrameLayout.LayoutParams(-1, -1))
+            addView(badge, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, px(16), px(16)) })
         })
+
+        handleShare(intent)
+        if (b == null && !Hub.running) startWatching()
     }
 
-    private fun fetch() {
-        if (fetching) return
-        val entry = remotes.entries.firstOrNull() ?: run { Hub.say("Nothing to receive (no other device is carrying)"); return }
-        fetching = true
-        val r = entry.value
+    override fun onStart() { super.onStart(); Hub.onChange = { runOnUiThread { refresh() } }; refresh() }
+    override fun onStop() { Hub.onChange = null; super.onStop() }
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleShare(intent) }
+
+    private fun refresh() {
+        status.text = Hub.status
+        handLabel.text = Hub.handText
+        logView.text = Hub.logText()
+        fileList.text = if (Hub.items.isEmpty()) "No files chosen" else Hub.items.joinToString("\n") { icon(it.second) + "  " + it.second }
+        codeView.text = Hub.codeText; codeView.visibility = if (Hub.codeText.isEmpty()) View.GONE else View.VISIBLE
+        bar.visibility = if (Hub.progress >= 0) View.VISIBLE else View.GONE; bar.progress = Hub.progress.coerceAtLeast(0)
+        toggle.text = if (Hub.running) "Stop watching" else "Start watching"
+        receiveBtn.text = if (Hub.remoteName != null) "Receive ●" else "Receive"
+        val n = Hub.carrying?.size
+        badge.visibility = if (n != null) View.VISIBLE else View.GONE
+        badge.text = "✊ Carrying " + (n ?: 0)
+    }
+
+    private fun nameOf(u: Uri): String =
+        contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { if (it.moveToFirst()) it.getString(0) else null } ?: u.lastPathSegment ?: "file"
+
+    private fun icon(n: String): String = when (n.substringAfterLast('.', "").lowercase()) {
+        "jpg", "jpeg", "png", "gif", "webp", "heic" -> "🖼"
+        "mp4", "mkv", "mov", "webm" -> "🎬"
+        "mp3", "wav", "m4a", "aac" -> "🎵"
+        "pdf" -> "📕"
+        else -> "📄"
+    }
+
+    private fun handleShare(i: Intent?) {
+        if (i?.action != Intent.ACTION_SEND) return
+        @Suppress("DEPRECATION") val u = i.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return
         thread {
-            try {
-                Hub.say("⬇ Asking ${r.label}… allow it on the other device")
-                val base = "http://${r.host}:${r.port}"
-                val dev = URLEncoder.encode(Build.MODEL, "UTF-8")
-                val names = open("$base/list?t=${r.token}&d=$dev", 40_000).inputStream.bufferedReader().use { it.readText() }
-                    .split("\n").filter { it.isNotBlank() }
-                names.forEachIndexed { i, n ->
-                    val c = open("$base/file?i=$i&t=${r.token}", 120_000)
-                    c.inputStream.use { save(n, c.contentType ?: "application/octet-stream", it) }
-                    Hub.progress = (i + 1) * 100 / names.size; Hub.onChange?.invoke()
-                }
-                remotes.remove(entry.key); Hub.remoteName = null
-                vibrate(); Hub.say("✅ Received ${names.size} file(s) in Downloads/GrabDrop")
-            } catch (e: Exception) { Hub.say("Receive failed: ${e.message}") }
-            finally { Hub.progress = -1; fetching = false; Hub.onChange?.invoke() }
+            val f = File(cacheDir, nameOf(u))
+            contentResolver.openInputStream(u)?.use { a -> f.outputStream().use { a.copyTo(it) } }
+            Hub.items.add(Uri.fromFile(f) to f.name); Hub.say("Shared file added: " + f.name)
         }
-    }
-
-    private fun open(url: String, readMs: Int): HttpURLConnection =
-        (URL(url).openConnection() as HttpURLConnection).apply { connectTimeout = 8000; readTimeout = readMs }
-            .also { if (it.responseCode != 200) error("other device answered ${it.responseCode} (denied?)") }
-
-    private fun save(rawName: String, mime: String, input: InputStream) {
-        val name = rawName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "file" }
-        if (Build.VERSION.SDK_INT >= 29) {
-            val v = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, name)
-                put(MediaStore.Downloads.MIME_TYPE, mime.substringBefore(';'))
-                put(MediaStore.Downloads.RELATIVE_PATH, "Download/GrabDrop")
-            }
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: error("could not create file")
-            contentResolver.openOutputStream(uri)?.use { input.copyTo(it) }
-        } else {
-            val dir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "GrabDrop").apply { mkdirs() }
-            File(dir, name).outputStream().use { input.copyTo(it) }
-        }
-    }
-
-    // ---------- helpers ----------
-    private fun vibrate() {
-        try { (getSystemService(Context.VIBRATOR_SERVICE) as Vibrator).vibrate(VibrationEffect.createWaveform(longArrayOf(0, 80, 40, 80), -1)) } catch (_: Exception) {}
-    }
-
-    private fun localIp(): String? = try {
-        java.net.NetworkInterface.getNetworkInterfaces().toList().flatMap { it.inetAddresses.toList() }
-            .firstOrNull { !it.isLoopbackAddress && it is java.net.Inet4Address && it.isSiteLocalAddress }?.hostAddress
-    } catch (_: Exception) { null }
-
-    override fun onDestroy() {
-        stopCarry("Stopped")
-        discoveries.forEach { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
-        landmarker?.close(); exec.shutdown()
-        Hub.running = false; Hub.handText = "service stopped"; Hub.remoteName = null
-        Hub.say("Stopped watching")
-        super.onDestroy()
     }
 }

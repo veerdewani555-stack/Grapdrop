@@ -85,10 +85,11 @@ class GestureService : LifecycleService() {
     // sending
     private var server: MultiServer? = null
     private var regListener: NsdManager.RegistrationListener? = null
+    @Volatile private var ownName = ""   // our own announced name, so we never 'receive' from ourselves
     @Volatile private var carryUntil = 0L
 
     // receiving
-    private var discovery: NsdManager.DiscoveryListener? = null
+    private val discoveries = mutableListOf<NsdManager.DiscoveryListener>()
     private val remotes = ConcurrentHashMap<String, Remote>()
     private val pending = ArrayDeque<NsdServiceInfo>()
     private var resolving = false
@@ -212,7 +213,7 @@ class GestureService : LifecycleService() {
             srv.start()
             server = srv; Hub.carrying = list; carryUntil = SystemClock.elapsedRealtime() + CARRY_MS
             val svc = NsdServiceInfo().apply {
-                serviceName = "GrabDrop-" + Build.MODEL; serviceType = SVC_PHONE; port = srv.port
+                ownName = "GrabDrop-" + Build.MODEL + "-" + token.take(4); serviceName = ownName; serviceType = SVC_PHONE; port = srv.port
                 setAttribute("t", token)
                 setAttribute("n", (list[0].second + if (list.size > 1) " +" + (list.size - 1) else "").take(60))
             }
@@ -270,9 +271,12 @@ class GestureService : LifecycleService() {
     }
 
     // ---------- laptop -> phone ----------
-    private fun startDiscovery() {
+    // Look for laptops (_grabdrop-pc) AND other phones (_grabdrop)
+    private fun startDiscovery() { discover(SVC_PC); discover(SVC_PHONE) }
+
+    private fun discover(type: String) {
         val l = object : NsdManager.DiscoveryListener {
-            override fun onServiceFound(s: NsdServiceInfo) { enqueue(s) }
+            override fun onServiceFound(s: NsdServiceInfo) { if (s.serviceName != ownName) enqueue(s) }
             override fun onServiceLost(s: NsdServiceInfo) {
                 remotes.remove(s.serviceName); Hub.remoteName = remotes.values.firstOrNull()?.label; Hub.onChange?.invoke()
             }
@@ -281,8 +285,8 @@ class GestureService : LifecycleService() {
             override fun onStartDiscoveryFailed(t: String, e: Int) { Hub.say("Laptop discovery failed (code $e)") }
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
         }
-        discovery = l
-        nsd.discoverServices(SVC_PC, NsdManager.PROTOCOL_DNS_SD, l)
+        discoveries.add(l)
+        nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l)
     }
 
     // NsdManager resolves one service at a time, so queue them
@@ -299,10 +303,10 @@ class GestureService : LifecycleService() {
                 val tok = i.attributes["t"]?.let { String(it) }
                 val label = i.attributes["n"]?.let { String(it) } ?: "files"
                 val host = i.host?.hostAddress
-                if (tok != null && host != null) {
+                if (tok != null && host != null && i.serviceName != ownName) {
                     remotes[i.serviceName] = Remote(host, i.port, tok, label)
                     Hub.remoteName = label
-                    Hub.say("💻 Laptop is carrying: $label. Fist → open palm, or tap Receive.")
+                    Hub.say("📲 ${i.serviceName.removePrefix("GrabDrop-")} is carrying: $label. Fist → open palm, or tap Receive.")
                 }
                 synchronized(pending) { resolving = false; resolveNext() }
             }
@@ -311,12 +315,12 @@ class GestureService : LifecycleService() {
 
     private fun fetch() {
         if (fetching) return
-        val entry = remotes.entries.firstOrNull() ?: run { Hub.say("Nothing to receive (laptop is not carrying)"); return }
+        val entry = remotes.entries.firstOrNull() ?: run { Hub.say("Nothing to receive (no other device is carrying)"); return }
         fetching = true
         val r = entry.value
         thread {
             try {
-                Hub.say("⬇ Asking ${r.label}… allow it on the laptop")
+                Hub.say("⬇ Asking ${r.label}… allow it on the other device")
                 val base = "http://${r.host}:${r.port}"
                 val dev = URLEncoder.encode(Build.MODEL, "UTF-8")
                 val names = open("$base/list?t=${r.token}&d=$dev", 40_000).inputStream.bufferedReader().use { it.readText() }
@@ -335,7 +339,7 @@ class GestureService : LifecycleService() {
 
     private fun open(url: String, readMs: Int): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply { connectTimeout = 8000; readTimeout = readMs }
-            .also { if (it.responseCode != 200) error("laptop answered ${it.responseCode} (denied?)") }
+            .also { if (it.responseCode != 200) error("other device answered ${it.responseCode} (denied?)") }
 
     private fun save(rawName: String, mime: String, input: InputStream) {
         val name = rawName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "file" }
@@ -365,7 +369,7 @@ class GestureService : LifecycleService() {
 
     override fun onDestroy() {
         stopCarry("Stopped")
-        try { discovery?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
+        discoveries.forEach { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
         landmarker?.close(); exec.shutdown()
         Hub.running = false; Hub.handText = "service stopped"; Hub.remoteName = null
         Hub.say("Stopped watching")

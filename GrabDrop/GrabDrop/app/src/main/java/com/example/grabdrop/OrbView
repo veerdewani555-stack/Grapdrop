@@ -1,0 +1,296 @@
+package com.example.grabdrop
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.os.SystemClock
+import android.view.View
+import androidx.core.graphics.ColorUtils
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.random.Random
+
+object Neon {
+    val bg = Color.parseColor("#04060D")
+    val panel = Color.parseColor("#0E1426")
+    val panel2 = Color.parseColor("#140F2E")
+    val cyan = Color.parseColor("#22D3EE")
+    val violet = Color.parseColor("#8B5CF6")
+    val pink = Color.parseColor("#F472B6")
+    val green = Color.parseColor("#34D399")
+    val amber = Color.parseColor("#FBBF24")
+    val text = Color.parseColor("#E6F1FF")
+    val muted = Color.parseColor("#7C8DB0")
+    fun alpha(color: Int, a: Float): Int = (color and 0x00FFFFFF) or ((a.coerceIn(0f, 1f) * 255).toInt() shl 24)
+}
+
+private const val TAU = (2.0 * PI).toFloat()
+
+/**
+ * The animated centre piece. Idle = slow rotating rings. Hand shapes tint and squeeze/expand the core.
+ * fx("grab") = rings collapse into the core. fx("sent"/"drop") = shockwave + particle burst + check mark.
+ * fx("incoming") = ripples converge. Carrying = orbiting particles + 60 s countdown arc.
+ */
+class OrbView(ctx: Context) : View(ctx) {
+    enum class Mode { IDLE, CARRYING, INCOMING }
+
+    var running = false
+    var hand: String? = null          // "fist", "open" or null
+    var progress = -1                 // 1..100 while a transfer is running
+    var count = 0
+    var centerText = "OFFLINE"
+    var mode = Mode.IDLE
+        set(v) { if (v == Mode.CARRYING && field != Mode.CARRYING) carryStart = SystemClock.uptimeMillis(); field = v }
+
+    private class Fx(val kind: String, val t0: Long, val dur: Long)
+    private class Spark(val ang: Float, val speed: Float, val size: Float, val color: Int)
+
+    private val fxs = mutableListOf<Fx>()
+    private var sparks: List<Spark> = emptyList()
+    private var sparkT0 = 0L
+    private var carryStart = 0L
+    private var coreScale = 1f
+    private var accent = Neon.cyan
+    private val start = SystemClock.uptimeMillis()
+    private val dp = ctx.resources.displayMetrics.density
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val box = RectF()
+    private val check = Path()
+    private val bold = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    private val dashes = arrayOf(
+        DashPathEffect(floatArrayOf(30f * dp, 16f * dp), 0f),
+        DashPathEffect(floatArrayOf(6f * dp, 10f * dp), 0f),
+        DashPathEffect(floatArrayOf(60f * dp, 24f * dp, 8f * dp, 24f * dp), 0f)
+    )
+    private val rings = arrayOf(floatArrayOf(0.84f, 22f, 2.5f), floatArrayOf(0.68f, -34f, 2f), floatArrayOf(0.53f, 50f, 3f))
+
+    private fun easeOut(x: Float) = 1f - (1f - x) * (1f - x) * (1f - x)
+
+    fun fx(kind: String) {
+        val now = SystemClock.uptimeMillis()
+        when (kind) {
+            "grab" -> fxs.add(Fx(kind, now, 900))
+            "sent", "drop" -> {
+                fxs.add(Fx(kind, now, 1700))
+                val r = Random(now)
+                val col = if (kind == "drop") Neon.green else Neon.cyan
+                sparks = List(60) { Spark(r.nextFloat() * TAU, 0.35f + r.nextFloat() * 0.9f, 1.5f + r.nextFloat() * 3.5f, if (r.nextInt(3) == 0) Neon.violet else col) }
+                sparkT0 = now
+            }
+            "incoming" -> fxs.add(Fx(kind, now, 1800))
+            "ask" -> fxs.add(Fx(kind, now, 1300))
+        }
+        invalidate()
+    }
+
+    override fun onDraw(c: Canvas) {
+        val now = SystemClock.uptimeMillis()
+        val t = (now - start) / 1000f
+        val cx = width / 2f
+        val cy = height / 2f
+        val r = min(width, height) / 2f * 0.94f
+        val dim = if (running) 1f else 0.35f
+        fxs.removeAll { now - it.t0 > it.dur }
+
+        val target = when {
+            mode == Mode.CARRYING -> Neon.pink
+            mode == Mode.INCOMING -> Neon.green
+            hand == "fist" -> Neon.pink
+            else -> Neon.cyan
+        }
+        accent = ColorUtils.blendARGB(accent, target, 0.12f)
+        val ts = when { !running -> 0.9f; hand == "fist" -> 0.8f; hand == "open" -> 1.15f; else -> 1f }
+        coreScale += (ts - coreScale) * 0.15f
+        val coreR = r * 0.25f * coreScale * (1f + 0.04f * sin(t * 3f))
+
+        // soft glow
+        p.style = Paint.Style.FILL
+        val pulse = 0.8f + 0.2f * sin(t * 2f)
+        for (i in 0..5) {
+            p.color = Neon.alpha(accent, (0.10f - i * 0.014f) * dim * pulse)
+            c.drawCircle(cx, cy, r * (0.36f + i * 0.11f), p)
+        }
+
+        // tick ring
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f * dp
+        p.color = Neon.alpha(accent, 0.55f * dim)
+        c.save(); c.rotate(t * 6f, cx, cy)
+        for (i in 0 until 90) {
+            val len = if (i % 5 == 0) 10f * dp else 5f * dp
+            c.drawLine(cx, cy - r, cx, cy - r + len, p)
+            c.rotate(4f, cx, cy)
+        }
+        c.restore()
+
+        // dashed rotating rings
+        for (i in 0..2) {
+            p.strokeWidth = rings[i][2] * dp
+            p.pathEffect = dashes[i]
+            p.color = Neon.alpha(if (i == 1) Neon.violet else accent, (0.5f + i * 0.15f) * dim)
+            c.save(); c.rotate(t * rings[i][1], cx, cy)
+            c.drawCircle(cx, cy, r * rings[i][0] * (1f + 0.012f * sin(t * 1.5f + i)), p)
+            c.restore()
+        }
+        p.pathEffect = null
+
+        // carry countdown (60 s)
+        if (mode == Mode.CARRYING) {
+            val frac = (1f - (now - carryStart) / 60000f).coerceIn(0f, 1f)
+            p.strokeWidth = 4f * dp; p.strokeCap = Paint.Cap.ROUND
+            p.color = Neon.alpha(Neon.pink, 0.9f)
+            box.set(cx - r * 0.95f, cy - r * 0.95f, cx + r * 0.95f, cy + r * 0.95f)
+            c.drawArc(box, -90f, 360f * frac, false, p)
+            p.strokeCap = Paint.Cap.BUTT
+        }
+
+        // transfer progress arc
+        if (progress > 0) {
+            p.strokeWidth = 7f * dp; p.strokeCap = Paint.Cap.ROUND
+            box.set(cx - r * 0.40f, cy - r * 0.40f, cx + r * 0.40f, cy + r * 0.40f)
+            p.color = Neon.alpha(Neon.green, 0.15f); c.drawArc(box, 0f, 360f, false, p)
+            p.color = Neon.alpha(Neon.green, 1f); c.drawArc(box, -90f, 3.6f * progress, false, p)
+            p.strokeCap = Paint.Cap.BUTT
+        }
+
+        p.style = Paint.Style.FILL
+        // orbiting particles while carrying
+        if (mode == Mode.CARRYING) {
+            val n = count.coerceIn(1, 8) + 2
+            for (i in 0 until n) {
+                val a = t * 1.6f + i * (TAU / n)
+                val x = cx + cos(a) * r * 0.53f
+                val y = cy + sin(a) * r * 0.53f
+                p.color = Neon.alpha(Neon.pink, 0.25f); c.drawCircle(x, y, 9f * dp, p)
+                p.color = Neon.alpha(Color.WHITE, 0.95f); c.drawCircle(x, y, 3.5f * dp, p)
+            }
+        }
+        // particles streaming inward when another device is carrying
+        if (mode == Mode.INCOMING) {
+            for (i in 0 until 14) {
+                val f = (t * 0.45f + i / 14f) % 1f
+                val rr = r * (1f - f * 0.78f)
+                val a = i * (TAU / 14f) + t * 0.2f
+                p.color = Neon.alpha(Neon.green, sin(f * PI.toFloat()) * 0.9f)
+                c.drawCircle(cx + cos(a) * rr, cy + sin(a) * rr, 3f * dp, p)
+            }
+        }
+
+        // core
+        p.color = Neon.alpha(accent, 0.12f * dim); c.drawCircle(cx, cy, coreR * 1.6f, p)
+        p.color = Neon.alpha(accent, 0.28f * dim); c.drawCircle(cx, cy, coreR * 1.25f, p)
+        p.color = Neon.alpha(accent, 0.95f * dim); c.drawCircle(cx, cy, coreR, p)
+        p.color = Neon.alpha(Color.WHITE, 0.88f * dim); c.drawCircle(cx, cy, coreR * 0.8f, p)
+
+        // one-shot effects
+        var checking = false
+        for (f in fxs) {
+            val pr = ((now - f.t0).toFloat() / f.dur).coerceIn(0f, 1f)
+            val e = easeOut(pr)
+            when (f.kind) {
+                "grab" -> {
+                    p.style = Paint.Style.STROKE; p.strokeWidth = 3f * dp
+                    for (k in 0..2) {
+                        val r0 = r * (1f - k * 0.14f)
+                        p.color = Neon.alpha(Neon.pink, (1f - pr) * 0.9f)
+                        c.drawCircle(cx, cy, r0 + (coreR * 1.1f - r0) * e, p)
+                    }
+                    p.style = Paint.Style.FILL
+                    val s = sin(pr * PI.toFloat())
+                    p.color = Neon.alpha(Color.WHITE, s * 0.8f)
+                    c.drawCircle(cx, cy, coreR * (1f + 0.7f * s), p)
+                }
+                "sent", "drop" -> {
+                    val col = if (f.kind == "drop") Neon.green else Neon.cyan
+                    p.style = Paint.Style.STROKE
+                    for (k in 0..1) {
+                        val q = ((pr - k * 0.18f) / (1f - k * 0.18f)).coerceIn(0f, 1f)
+                        p.strokeWidth = (1f + 6f * (1f - q)) * dp
+                        p.color = Neon.alpha(col, (1f - q) * 0.9f)
+                        c.drawCircle(cx, cy, coreR + (r * 1.12f - coreR) * easeOut(q), p)
+                    }
+                    checking = true
+                    val ca = (sin(pr * PI.toFloat()) * 2f).coerceIn(0f, 1f)
+                    check.reset()
+                    check.moveTo(cx - coreR * 0.38f, cy + coreR * 0.02f)
+                    check.lineTo(cx - coreR * 0.10f, cy + coreR * 0.32f)
+                    check.lineTo(cx + coreR * 0.42f, cy - coreR * 0.30f)
+                    p.strokeWidth = 6f * dp; p.strokeCap = Paint.Cap.ROUND; p.strokeJoin = Paint.Join.ROUND
+                    p.color = Neon.alpha(col, ca)
+                    c.drawPath(check, p)
+                    p.strokeCap = Paint.Cap.BUTT
+                }
+                "incoming" -> {
+                    p.style = Paint.Style.STROKE; p.strokeWidth = 2.5f * dp
+                    for (k in 0..2) {
+                        val pk = (pr * 1.6f - k * 0.3f).coerceIn(0f, 1f)
+                        p.color = Neon.alpha(Neon.green, sin(pk * PI.toFloat()) * 0.7f)
+                        c.drawCircle(cx, cy, r * 1.1f + (coreR - r * 1.1f) * pk, p)
+                    }
+                }
+                "ask" -> {
+                    p.style = Paint.Style.STROKE; p.strokeWidth = 3f * dp
+                    p.color = Neon.alpha(Neon.amber, (1f - pr) * 0.85f)
+                    c.drawCircle(cx, cy, r * (0.5f + 0.1f * sin(pr * PI.toFloat() * 4f)), p)
+                }
+            }
+        }
+
+        // particle burst
+        val sp = ((now - sparkT0) / 1700f)
+        if (sp in 0f..1f) {
+            p.style = Paint.Style.FILL
+            val d = easeOut(sp)
+            for (s in sparks) {
+                p.color = Neon.alpha(s.color, 1f - sp)
+                c.drawCircle(cx + cos(s.ang) * r * s.speed * 1.25f * d, cy + sin(s.ang) * r * s.speed * 1.25f * d, s.size * dp * (1f - sp * 0.5f), p)
+            }
+        }
+
+        // label in the core
+        if (!checking) {
+            p.style = Paint.Style.FILL; p.textAlign = Paint.Align.CENTER; p.typeface = bold
+            p.textSize = coreR * 0.30f
+            p.color = Neon.alpha(Neon.bg, 0.9f)
+            c.drawText(centerText, cx, cy - (p.descent() + p.ascent()) / 2f, p)
+        }
+        postInvalidateOnAnimation()
+    }
+}
+
+/** Dark sci-fi background: drifting grid, twinkling stars, and a slow scan line. */
+class GridView(ctx: Context) : View(ctx) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val start = SystemClock.uptimeMillis()
+    private val dp = ctx.resources.displayMetrics.density
+    private val stars = Random(7).let { r -> List(70) { floatArrayOf(r.nextFloat(), r.nextFloat(), r.nextFloat() * TAU, 0.5f + r.nextFloat() * 1.5f) } }
+
+    override fun onDraw(c: Canvas) {
+        val t = (SystemClock.uptimeMillis() - start) / 1000f
+        val w = width.toFloat(); val h = height.toFloat()
+        p.style = Paint.Style.STROKE; p.strokeWidth = 1f
+        p.color = Neon.alpha(Neon.cyan, 0.06f)
+        val step = 36f * dp
+        var x = (t * 6f * dp) % step
+        while (x < w) { c.drawLine(x, 0f, x, h, p); x += step }
+        var y = (t * 10f * dp) % step
+        while (y < h) { c.drawLine(0f, y, w, y, p); y += step }
+        p.style = Paint.Style.FILL
+        for (s in stars) {
+            p.color = Neon.alpha(Neon.text, 0.12f + 0.35f * (0.5f + 0.5f * sin(t * s[3] + s[2])))
+            c.drawCircle(s[0] * w, s[1] * h, 1.2f * dp, p)
+        }
+        p.style = Paint.Style.STROKE; p.strokeWidth = 2f * dp
+        p.color = Neon.alpha(Neon.cyan, 0.06f)
+        val sy = ((t * 0.12f) % 1f) * h
+        c.drawLine(0f, sy, w, sy, p)
+        postInvalidateOnAnimation()
+    }
+}

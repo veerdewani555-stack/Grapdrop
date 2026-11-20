@@ -1,5 +1,6 @@
 package com.example.grabdrop
 
+import android.content.Context
 import android.net.Uri
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -21,6 +22,35 @@ object Hub {
     @Volatile var onChange: (() -> Unit)? = null
     /** Animation events for the UI: grab, sent, drop, incoming, ask. */
     @Volatile var onFx: ((String) -> Unit)? = null
+
+    /** Devices currently carrying files for us: (device name, file label). Shown on the radar. */
+    @Volatile var nearby: List<Pair<String, String>> = emptyList()
+
+    /** One finished transfer. dir = "in" or "out". uri is only set for received files we can reopen. */
+    class Entry(val dir: String, val name: String, val mime: String, val uri: String?, val peer: String, val time: Long)
+    val history = CopyOnWriteArrayList<Entry>()   // newest first
+    @Volatile var historyVersion = 0
+
+    fun addHistory(ctx: Context, e: Entry) {
+        history.add(0, e)
+        while (history.size > 40) history.removeAt(history.size - 1)
+        historyVersion++
+        try {
+            ctx.getSharedPreferences("grabdrop", Context.MODE_PRIVATE).edit().putString("history",
+                history.joinToString("\u0002") { listOf(it.dir, it.name, it.mime, it.uri ?: "", it.peer, it.time.toString()).joinToString("\u0001") }).apply()
+        } catch (_: Exception) {}
+        onChange?.invoke()
+    }
+
+    fun loadHistory(ctx: Context) {
+        if (history.isNotEmpty()) return
+        val raw = ctx.getSharedPreferences("grabdrop", Context.MODE_PRIVATE).getString("history", "") ?: ""
+        raw.split("\u0002").filter { it.isNotBlank() }.forEach {
+            val f = it.split("\u0001")
+            if (f.size >= 6) history.add(Entry(f[0], f[1], f[2], f[3].ifBlank { null }, f[4], f[5].toLongOrNull() ?: 0L))
+        }
+        historyVersion++
+    }
 
     private val log = ArrayDeque<String>()
 

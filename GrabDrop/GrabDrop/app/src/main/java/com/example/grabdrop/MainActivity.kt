@@ -1,6 +1,15 @@
 package com.example.grabdrop
 
 import android.Manifest
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.text.TextUtils
+import android.view.ViewOutlineProvider
+import android.widget.ImageView
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -56,6 +65,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var toggle: Button
     private lateinit var receiveBtn: Button
     private var cardIndex = 0
+    private lateinit var historyBox: LinearLayout
+    private var shownVersion = -1
+    private var renderHistory: () -> Unit = {}
+    private val thumbCache = ConcurrentHashMap<String, Bitmap>()
 
     private val picker = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         uris.forEach { Hub.items.add(it to nameOf(it)) }
@@ -92,8 +105,10 @@ class MainActivity : ComponentActivity() {
         fun text(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
             text = t; textSize = size; setTextColor(color); typeface = if (bold) monoBold else mono
         }
-        fun button(t: String, primary: Boolean, f: () -> Unit) = Button(this).apply {
-            text = t; isAllCaps = false; textSize = 13f; typeface = monoBold; stateListAnimator = null
+        fun button(t: String, primary: Boolean, size: Float = 14f, f: () -> Unit) = Button(this).apply {
+            text = t; isAllCaps = false; textSize = size; typeface = monoBold; stateListAnimator = null
+            minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0; maxLines = 1; gravity = Gravity.CENTER
+            setPadding(px(10), 0, px(10), 0)
             setTextColor(if (primary) Neon.bg else Neon.cyan)
             val colors = if (primary) intArrayOf(Neon.cyan, Neon.violet)
                          else intArrayOf(Neon.alpha(Neon.cyan, 0.08f), Neon.alpha(Neon.violet, 0.08f))
@@ -111,6 +126,7 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { f() }
         }
         fun LinearLayout.put(v: View, top: Int = 8) = addView(v, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(top) })
+        fun LinearLayout.putH(v: View, h: Int, top: Int = 8) = addView(v, LinearLayout.LayoutParams(-1, px(h)).apply { topMargin = px(top) })
 
         val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(40), px(16), px(40)) }
 
@@ -145,19 +161,28 @@ class MainActivity : ComponentActivity() {
         codeView = text("", 15f, Neon.cyan, true).apply { visibility = View.GONE; setTextIsSelectable(true) }
         c1.put(codeView)
         toggle = button("Start watching", true) { if (Hub.running) GestureService.stop(this) else startWatching() }
-        c1.put(toggle, 12)
+        c1.putH(toggle, 52, 14)
 
         // ---- payload ----
         val c2 = card("Payload")
+        c2.putH(button("+  Choose files", true) { picker.launch("*/*") }, 52, 12)
         val row = LinearLayout(this)
-        fun addBtn(t: String, primary: Boolean, f: () -> Unit) =
-            button(t, primary, f).also { row.addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = px(6) }) }
-        addBtn("Choose", true) { picker.launch("*/*") }
-        addBtn("Grab", false) { cmd(GestureService.GRAB) }
-        addBtn("Cancel", false) { cmd(GestureService.CANCEL) }
-        receiveBtn = addBtn("Receive", false) { cmd(GestureService.FETCH) }
+        var firstBtn = true
+        fun addBtn(t: String, f: () -> Unit) =
+            button(t, false, 12f, f).also {
+                row.addView(it, LinearLayout.LayoutParams(0, px(46), 1f).apply { if (!firstBtn) marginStart = px(8) })
+                firstBtn = false
+            }
+        addBtn("Grab") { cmd(GestureService.GRAB) }
+        receiveBtn = addBtn("Receive") { cmd(GestureService.FETCH) }
+        addBtn("Cancel") { cmd(GestureService.CANCEL) }
         c2.put(row, 10)
-        fileList = text("", 13f, Neon.text); c2.put(fileList, 12)
+        fileList = text("", 13f, Neon.text); c2.put(fileList, 14)
+        val clear = text("CLEAR LIST", 11f, Neon.pink, true).apply {
+            letterSpacing = 0.15f; setPadding(0, px(10), 0, px(4))
+            setOnClickListener { Hub.items.clear(); Hub.say("File list cleared") }
+        }
+        c2.put(clear, 2)
         c2.put(CheckBox(this).apply {
             text = "Keep a copy after sending"; typeface = mono; textSize = 12f
             setTextColor(Neon.muted); buttonTintList = ColorStateList.valueOf(Neon.cyan)
@@ -167,6 +192,39 @@ class MainActivity : ComponentActivity() {
             max = 100; visibility = View.GONE; progressTintList = ColorStateList.valueOf(Neon.green)
         }
         c2.put(bar)
+
+        // ---- transfers (history + thumbnails) ----
+        val c5 = card("Transfers")
+        historyBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c5.put(historyBox, 6)
+        fun historyRow(e: Hub.Entry): View {
+            val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, px(6), 0, px(6)) }
+            val tile = FrameLayout(this).apply {
+                background = GradientDrawable().apply { setColor(Neon.alpha(Neon.cyan, 0.10f)); cornerRadius = px(10).toFloat() }
+                outlineProvider = ViewOutlineProvider.BACKGROUND; clipToOutline = true
+            }
+            tile.addView(text(icon(e.name), 18f, Neon.text).apply { gravity = Gravity.CENTER }, FrameLayout.LayoutParams(-1, -1))
+            if (e.mime.startsWith("image/") && e.uri != null) {
+                val iv = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                tile.addView(iv, FrameLayout.LayoutParams(-1, -1))
+                loadThumb(e.uri, iv)
+            }
+            row2.addView(tile, LinearLayout.LayoutParams(px(46), px(46)))
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(text(e.name, 13f, Neon.text, true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.MIDDLE })
+            val who = if (e.dir == "in") "↓ from " + e.peer.ifBlank { "device" } else "↑ sent"
+            col.addView(text(who + "  ·  " + timeText(e.time), 11f, Neon.muted))
+            row2.addView(col, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = px(12) })
+            if (e.dir == "in" && e.uri != null) row2.setOnClickListener { openFile(e) }
+            return row2
+        }
+        renderHistory = {
+            historyBox.removeAllViews()
+            val list = Hub.history.toList().take(8)
+            if (list.isEmpty()) historyBox.addView(text("No transfers yet. Tap a received file to open it.", 12f, Neon.muted))
+            else list.forEach { historyBox.addView(historyRow(it)) }
+        }
+        Hub.loadHistory(this)
 
         // ---- gesture sensor ----
         val c3 = card("Gesture sensor")
@@ -241,6 +299,8 @@ class MainActivity : ComponentActivity() {
         orb.mode = when { n != null -> OrbView.Mode.CARRYING; Hub.remoteName != null -> OrbView.Mode.INCOMING; else -> OrbView.Mode.IDLE }
         orb.progress = if (Hub.progress > 0) Hub.progress else -1
         orb.count = n ?: 0
+        orb.devices = Hub.nearby.map { it.first }
+        if (shownVersion != Hub.historyVersion) { shownVersion = Hub.historyVersion; renderHistory() }
         orb.centerText = when {
             !running -> "OFFLINE"
             Hub.progress > 0 -> "${Hub.progress}%"
@@ -249,6 +309,32 @@ class MainActivity : ComponentActivity() {
             orb.hand == "fist" -> "FIST"
             orb.hand == "open" -> "PALM"
             else -> "READY"
+        }
+    }
+
+    private fun timeText(ms: Long): String = SimpleDateFormat("d MMM, HH:mm", Locale.getDefault()).format(Date(ms))
+
+    private fun openFile(e: Hub.Entry) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(e.uri), e.mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) { Hub.say("No app found to open " + e.name) }
+    }
+
+    /** Small thumbnail, decoded off the UI thread. */
+    private fun loadThumb(uri: String, iv: ImageView) {
+        thumbCache[uri]?.let { iv.setImageBitmap(it); return }
+        thread {
+            try {
+                val u = Uri.parse(uri)
+                val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o) }
+                var s = 1
+                while (o.outWidth / s > 240 && o.outHeight / s > 240) s *= 2
+                val o2 = BitmapFactory.Options().apply { inSampleSize = s }
+                val bmp = contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o2) }
+                if (bmp != null) { thumbCache[uri] = bmp; runOnUiThread { iv.setImageBitmap(bmp) } }
+            } catch (_: Exception) {}
         }
     }
 
@@ -305,6 +391,7 @@ class OrbView(ctx: Context) : View(ctx) {
     var hand: String? = null          // "fist", "open" or null
     var progress = -1                 // 1..100 while a transfer is running
     var count = 0
+    var devices: List<String> = emptyList()   // nearby devices shown on the radar
     var centerText = "OFFLINE"
     var mode = Mode.IDLE
         set(v) { if (v == Mode.CARRYING && field != Mode.CARRYING) carryStart = SystemClock.uptimeMillis(); field = v }
@@ -440,6 +527,30 @@ class OrbView(ctx: Context) : View(ctx) {
                 val a = i * (TAU / 14f) + t * 0.2f
                 p.color = Neon.alpha(Neon.green, sin(f * PI.toFloat()) * 0.9f)
                 c.drawCircle(cx + cos(a) * rr, cy + sin(a) * rr, 3f * dp, p)
+            }
+        }
+
+        // radar sweep + nearby devices
+        if (running) {
+            p.style = Paint.Style.FILL
+            p.color = Neon.alpha(accent, if (devices.isEmpty()) 0.05f else 0.13f)
+            box.set(cx - r * 0.9f, cy - r * 0.9f, cx + r * 0.9f, cy + r * 0.9f)
+            c.drawArc(box, t * 90f - 28f, 28f, true, p)
+            val n = devices.size.coerceAtMost(5)
+            for (i in 0 until n) {
+                val a = -PI.toFloat() / 2f + (if (n == 1) 0.7f else i * TAU / n) + sin(t * 0.6f + i) * 0.04f
+                val x = cx + cos(a) * r * 0.76f
+                val y = cy + sin(a) * r * 0.76f
+                val ping = (t * 0.8f + i * 0.3f) % 1f
+                p.style = Paint.Style.STROKE; p.strokeWidth = 1.5f * dp
+                p.color = Neon.alpha(Neon.green, (1f - ping) * 0.8f)
+                c.drawCircle(x, y, 6f * dp + ping * 14f * dp, p)
+                p.style = Paint.Style.FILL
+                p.color = Neon.alpha(Neon.green, 0.3f); c.drawCircle(x, y, 10f * dp, p)
+                p.color = Neon.alpha(Color.WHITE, 1f); c.drawCircle(x, y, 4f * dp, p)
+                p.textAlign = Paint.Align.CENTER; p.typeface = bold; p.textSize = 9.5f * dp
+                p.color = Neon.alpha(Neon.green, 1f)
+                c.drawText(devices[i].take(12), x, y + 22f * dp, p)
             }
         }
 

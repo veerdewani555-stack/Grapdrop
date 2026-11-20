@@ -66,7 +66,7 @@ class GestureService : LifecycleService() {
         fun stop(c: Context) { c.stopService(Intent(c, GestureService::class.java)) }
     }
 
-    private data class Remote(val host: String, val port: Int, val token: String, val label: String)
+    private data class Remote(val host: String, val port: Int, val token: String, val label: String, val device: String)
 
     private val main = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
@@ -236,6 +236,8 @@ class GestureService : LifecycleService() {
         val c = Hub.carrying
         try { regListener?.let { nsd.unregisterService(it) } } catch (_: Exception) {}
         regListener = null; server?.stop(); server = null; Hub.carrying = null
+        if (msg.startsWith("✅ Sent") && c != null)
+            c.forEach { Hub.addHistory(this, Hub.Entry("out", it.second, "", null, "", System.currentTimeMillis())) }
         if (remove && c != null && !Hub.keepCopy) Hub.items.removeAll(c)
         Hub.progress = -1; Hub.codeText = ""
         Hub.say(msg)
@@ -278,7 +280,7 @@ class GestureService : LifecycleService() {
         val l = object : NsdManager.DiscoveryListener {
             override fun onServiceFound(s: NsdServiceInfo) { if (s.serviceName != ownName) enqueue(s) }
             override fun onServiceLost(s: NsdServiceInfo) {
-                remotes.remove(s.serviceName); Hub.remoteName = remotes.values.firstOrNull()?.label; Hub.onChange?.invoke()
+                remotes.remove(s.serviceName); syncRemotes()
             }
             override fun onDiscoveryStarted(t: String) {}
             override fun onDiscoveryStopped(t: String) {}
@@ -287,6 +289,12 @@ class GestureService : LifecycleService() {
         }
         discoveries.add(l)
         nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, l)
+    }
+
+    private fun syncRemotes() {
+        Hub.nearby = remotes.values.map { it.device to it.label }
+        Hub.remoteName = remotes.values.firstOrNull()?.label
+        Hub.onChange?.invoke()
     }
 
     // NsdManager resolves one service at a time, so queue them
@@ -304,9 +312,10 @@ class GestureService : LifecycleService() {
                 val label = i.attributes["n"]?.let { String(it) } ?: "files"
                 val host = i.host?.hostAddress
                 if (tok != null && host != null && i.serviceName != ownName) {
-                    remotes[i.serviceName] = Remote(host, i.port, tok, label)
-                    Hub.remoteName = label
-                    Hub.say("📲 ${i.serviceName.removePrefix("GrabDrop-")} is carrying: $label. Fist → open palm, or tap Receive.")
+                    val dev = i.serviceName.removePrefix("GrabDrop-").replace(Regex("-[0-9a-f]{4}$"), "")
+                    remotes[i.serviceName] = Remote(host, i.port, tok, label, dev)
+                    syncRemotes()
+                    Hub.say("📲 $dev is carrying: $label. Fist → open palm, or tap Receive.")
                 }
                 synchronized(pending) { resolving = false; resolveNext() }
             }
@@ -327,10 +336,12 @@ class GestureService : LifecycleService() {
                     .split("\n").filter { it.isNotBlank() }
                 names.forEachIndexed { i, n ->
                     val c = open("$base/file?i=$i&t=${r.token}", 120_000)
-                    c.inputStream.use { save(n, c.contentType ?: "application/octet-stream", it) }
+                    val mimeStr = (c.contentType ?: "application/octet-stream").substringBefore(';')
+                    val saved = c.inputStream.use { save(n, mimeStr, it) }
+                    Hub.addHistory(this@GestureService, Hub.Entry("in", n, mimeStr, saved, r.device, System.currentTimeMillis()))
                     Hub.progress = (i + 1) * 100 / names.size; Hub.onChange?.invoke()
                 }
-                remotes.remove(entry.key); Hub.remoteName = null
+                remotes.remove(entry.key); syncRemotes()
                 vibrate(); Hub.say("✅ Received ${names.size} file(s) in Downloads/GrabDrop")
             } catch (e: Exception) { Hub.say("Receive failed: ${e.message}") }
             finally { Hub.progress = -1; fetching = false; Hub.onChange?.invoke() }
@@ -341,7 +352,7 @@ class GestureService : LifecycleService() {
         (URL(url).openConnection() as HttpURLConnection).apply { connectTimeout = 8000; readTimeout = readMs }
             .also { if (it.responseCode != 200) error("other device answered ${it.responseCode} (denied?)") }
 
-    private fun save(rawName: String, mime: String, input: InputStream) {
+    private fun save(rawName: String, mime: String, input: InputStream): String? {
         val name = rawName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "file" }
         if (Build.VERSION.SDK_INT >= 29) {
             val v = ContentValues().apply {
@@ -351,9 +362,11 @@ class GestureService : LifecycleService() {
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: error("could not create file")
             contentResolver.openOutputStream(uri)?.use { input.copyTo(it) }
+            return uri.toString()
         } else {
             val dir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "GrabDrop").apply { mkdirs() }
             File(dir, name).outputStream().use { input.copyTo(it) }
+            return null
         }
     }
 
@@ -371,7 +384,7 @@ class GestureService : LifecycleService() {
         stopCarry("Stopped")
         discoveries.forEach { try { nsd.stopServiceDiscovery(it) } catch (_: Exception) {} }
         landmarker?.close(); exec.shutdown()
-        Hub.running = false; Hub.handText = "service stopped"; Hub.remoteName = null
+        Hub.running = false; Hub.handText = "service stopped"; Hub.remoteName = null; Hub.nearby = emptyList()
         Hub.say("Stopped watching")
         super.onDestroy()
     }

@@ -67,6 +67,9 @@ class MainActivity : ComponentActivity() {
     private var cardIndex = 0
     private lateinit var historyBox: LinearLayout
     private var shownVersion = -1
+    private lateinit var trustedBox: LinearLayout
+    private var shownTrusted = -1
+    private var renderTrusted: () -> Unit = {}
     private var renderHistory: () -> Unit = {}
     private val thumbCache = ConcurrentHashMap<String, Bitmap>()
 
@@ -241,6 +244,26 @@ class MainActivity : ComponentActivity() {
             })
         }, 0)
 
+        // ---- trusted devices ----
+        val c6 = card("Trusted devices")
+        trustedBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c6.put(trustedBox, 6)
+        renderTrusted = {
+            trustedBox.removeAllViews()
+            if (Hub.trusted.isEmpty())
+                trustedBox.addView(text("None yet. Tap \"Always\" on an approval request to skip future prompts for that device.", 12f, Neon.muted))
+            else Hub.trusted.entries.forEach { en ->
+                val r2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, px(4), 0, px(4)) }
+                r2.addView(text("🔓  " + en.value, 13f, Neon.text), LinearLayout.LayoutParams(0, -2, 1f))
+                r2.addView(text("FORGET", 11f, Neon.pink, true).apply {
+                    letterSpacing = 0.15f; setPadding(px(10), px(10), px(4), px(10))
+                    setOnClickListener { Hub.forget(this@MainActivity, en.key) }
+                })
+                trustedBox.addView(r2)
+            }
+        }
+        Hub.loadTrusted(this)
+
         // ---- activity log ----
         val c4 = card("Activity log")
         logView = text("", 11.5f, Neon.muted); c4.put(logView, 8)
@@ -301,6 +324,7 @@ class MainActivity : ComponentActivity() {
         orb.count = n ?: 0
         orb.devices = Hub.nearby.map { it.first }
         if (shownVersion != Hub.historyVersion) { shownVersion = Hub.historyVersion; renderHistory() }
+        if (shownTrusted != Hub.trustedVersion) { shownTrusted = Hub.trustedVersion; renderTrusted() }
         orb.centerText = when {
             !running -> "OFFLINE"
             Hub.progress > 0 -> "${Hub.progress}%"

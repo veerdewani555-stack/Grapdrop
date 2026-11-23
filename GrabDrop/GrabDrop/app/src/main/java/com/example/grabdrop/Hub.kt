@@ -52,6 +52,34 @@ object Hub {
         historyVersion++
     }
 
+    /** Devices the user chose "Always" for: persistent device id -> display name. */
+    val trusted = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile var trustedVersion = 0
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences("grabdrop", Context.MODE_PRIVATE)
+
+    /** This phone's own persistent id; sent with every request so other devices can recognise it. */
+    fun myId(ctx: Context): String {
+        val p = prefs(ctx)
+        return p.getString("myid", null) ?: java.util.UUID.randomUUID().toString().also { p.edit().putString("myid", it).apply() }
+    }
+
+    private fun saveTrusted(ctx: Context) {
+        prefs(ctx).edit().putString("trusted", trusted.entries.joinToString("\u0002") { it.key + "\u0001" + it.value }).apply()
+    }
+
+    fun loadTrusted(ctx: Context) {
+        if (trusted.isNotEmpty()) return
+        (prefs(ctx).getString("trusted", "") ?: "").split("\u0002").filter { it.isNotBlank() }.forEach {
+            val f = it.split("\u0001")
+            if (f.size >= 2) trusted[f[0]] = f[1]
+        }
+        trustedVersion++
+    }
+
+    fun trust(ctx: Context, id: String, name: String) { trusted[id] = name; saveTrusted(ctx); trustedVersion++; onChange?.invoke() }
+    fun forget(ctx: Context, id: String) { trusted.remove(id); saveTrusted(ctx); trustedVersion++; onChange?.invoke() }
+
     private val log = ArrayDeque<String>()
 
     fun say(msg: String, addToLog: Boolean = true) {

@@ -95,7 +95,7 @@ class GestureService : LifecycleService() {
     private var resolving = false
     @Volatile private var fetching = false
 
-    override fun onCreate() { super.onCreate(); Hub.running = true }
+    override fun onCreate() { super.onCreate(); Hub.running = true; Hub.loadTrusted(this) }
 
     override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(i, flags, startId)
@@ -244,23 +244,26 @@ class GestureService : LifecycleService() {
     }
 
     /** Called from the server thread for each new device. Shows Allow/Deny on a notification; denies on timeout. */
-    private fun ask(ip: String, device: String): Boolean {
+    private fun ask(ip: String, device: String, peerId: String): Boolean {
+        if (peerId.isNotBlank() && Hub.trusted.containsKey(peerId)) {
+            Hub.say("Auto-allowed trusted device: $device"); return true
+        }
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
             Hub.say("Blocked $device: turn on notifications so you can approve transfers"); return false
         }
         val id = UUID.randomUUID().toString()
-        val yes = "com.example.grabdrop.Y$id"; val no = "com.example.grabdrop.N$id"
-        val latch = CountDownLatch(1); val ok = AtomicBoolean(false)
+        val yes = "com.example.grabdrop.Y$id"; val no = "com.example.grabdrop.N$id"; val alw = "com.example.grabdrop.A$id"
+        val latch = CountDownLatch(1); val ok = AtomicBoolean(false); val always = AtomicBoolean(false)
         val rcv = object : BroadcastReceiver() {
-            override fun onReceive(c: Context, i: Intent) { ok.set(i.action == yes); latch.countDown() }
+            override fun onReceive(c: Context, i: Intent) { ok.set(i.action == yes || i.action == alw); always.set(i.action == alw); latch.countDown() }
         }
-        ContextCompat.registerReceiver(this, rcv, IntentFilter().apply { addAction(yes); addAction(no) }, ContextCompat.RECEIVER_NOT_EXPORTED)
+        ContextCompat.registerReceiver(this, rcv, IntentFilter().apply { addAction(yes); addAction(alw); addAction(no) }, ContextCompat.RECEIVER_NOT_EXPORTED)
         fun pi(a: String) = PendingIntent.getBroadcast(this, 0, Intent(a).setPackage(packageName), PendingIntent.FLAG_IMMUTABLE)
         val nid = 1000 + (id.hashCode() and 0xFFFF)
         val n = NotificationCompat.Builder(this, CH_ASK).setSmallIcon(android.R.drawable.ic_menu_share)
             .setContentTitle("Allow \"$device\" to take your files?").setContentText("Request from $ip. Only allow your own device.")
             .setPriority(NotificationCompat.PRIORITY_HIGH).setCategory(NotificationCompat.CATEGORY_CALL)
-            .addAction(0, "Allow", pi(yes)).addAction(0, "Deny", pi(no)).setTimeoutAfter(20_000).build()
+            .addAction(0, "Allow once", pi(yes)).addAction(0, "Always", pi(alw)).addAction(0, "Deny", pi(no)).setTimeoutAfter(20_000).build()
         val nm = getSystemService(NotificationManager::class.java)
         nm.notify(nid, n); vibrate()
         Hub.say("🔐 $device ($ip) is asking to receive. Approve it in the notification.")
@@ -268,6 +271,7 @@ class GestureService : LifecycleService() {
         try { unregisterReceiver(rcv) } catch (_: Exception) {}
         nm.cancel(nid)
         val allowed = answered && ok.get()
+        if (allowed && always.get() && peerId.isNotBlank()) { Hub.trust(this, peerId, device); Hub.say("Trusted $device. No more prompts for it.") }
         Hub.say(if (allowed) "Allowed $device" else "Denied $device")
         return allowed
     }
@@ -332,7 +336,7 @@ class GestureService : LifecycleService() {
                 Hub.say("⬇ Asking ${r.label}… allow it on the other device")
                 val base = "http://${r.host}:${r.port}"
                 val dev = URLEncoder.encode(Build.MODEL, "UTF-8")
-                val names = open("$base/list?t=${r.token}&d=$dev", 40_000).inputStream.bufferedReader().use { it.readText() }
+                val names = open("$base/list?t=${r.token}&d=$dev&id=${Hub.myId(this@GestureService)}", 40_000).inputStream.bufferedReader().use { it.readText() }
                     .split("\n").filter { it.isNotBlank() }
                 names.forEachIndexed { i, n ->
                     val c = open("$base/file?i=$i&t=${r.token}", 120_000)

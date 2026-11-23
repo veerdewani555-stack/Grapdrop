@@ -17,7 +17,7 @@ class MultiServer(
     private val cr: ContentResolver,
     private val files: List<Pair<Uri, String>>,
     private val token: String,
-    private val ask: (ip: String, device: String) -> Boolean,
+    private val ask: (ip: String, device: String, id: String) -> Boolean,
     private val onProgress: (Int, Int) -> Unit,
     private val onAllServed: () -> Unit
 ) {
@@ -51,7 +51,8 @@ class MultiServer(
                 if (ip !in allowed && ip !in denied) {
                     val dev = Regex("[?&]d=([^&\\s]+)").find(first)?.groupValues?.get(1)
                         ?.let { URLDecoder.decode(it, "UTF-8") } ?: ip
-                    if (ask(ip, dev)) allowed.add(ip) else denied.add(ip)
+                    val pid = Regex("[?&]id=([^&\\s]+)").find(first)?.groupValues?.get(1) ?: ""
+                    if (ask(ip, dev, pid)) allowed.add(ip) else denied.add(ip)
                 }
             }
             if (ip !in allowed) { reply("403 Forbidden"); return@use }

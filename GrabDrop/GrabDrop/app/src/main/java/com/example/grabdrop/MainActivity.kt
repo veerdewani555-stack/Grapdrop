@@ -1,6 +1,8 @@
 package com.example.grabdrop
 
 import android.Manifest
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.text.TextUtils
@@ -65,6 +67,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var toggle: Button
     private lateinit var receiveBtn: Button
     private var cardIndex = 0
+    private lateinit var hero: ImageView
+    private var heroUri: String? = null
+    private var heroOn = false
+    private lateinit var reveal: FrameLayout
+    private lateinit var revealCard: FrameLayout
+    private lateinit var revealImg: ImageView
+    private lateinit var revealCap: TextView
+    private var revealId = 0
     private lateinit var historyBox: LinearLayout
     private var shownVersion = -1
     private lateinit var trustedBox: LinearLayout
@@ -151,7 +161,18 @@ class MainActivity : ComponentActivity() {
         subtitle = text("", 11f, Neon.muted).apply { letterSpacing = 0.2f; gravity = Gravity.CENTER }
         content.put(subtitle, 2)
         orb = OrbView(this)
-        content.addView(orb, LinearLayout.LayoutParams(-1, px(320)).apply { topMargin = px(6) })
+        hero = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP; visibility = View.GONE
+            setPadding(px(3), px(3), px(3), px(3))
+            background = GradientDrawable().apply {
+                setColor(Neon.alpha(Neon.cyan, 0.15f)); cornerRadius = px(18).toFloat(); setStroke(px(2), Neon.alpha(Neon.cyan, 0.85f))
+            }
+            outlineProvider = ViewOutlineProvider.BACKGROUND; clipToOutline = true
+        }
+        val orbHolder = FrameLayout(this)
+        orbHolder.addView(orb, FrameLayout.LayoutParams(-1, -1))
+        orbHolder.addView(hero, FrameLayout.LayoutParams(px(150), px(150), Gravity.CENTER))
+        content.addView(orbHolder, LinearLayout.LayoutParams(-1, px(320)).apply { topMargin = px(6) })
         status = text("", 14f, Neon.text, true).apply { gravity = Gravity.CENTER }
         content.put(status, 4)
         handLabel = text("", 12f, Neon.muted).apply { gravity = Gravity.CENTER }
@@ -168,7 +189,10 @@ class MainActivity : ComponentActivity() {
 
         // ---- payload ----
         val c2 = card("Payload")
-        c2.putH(button("+  Choose files", true) { picker.launch("*/*") }, 52, 12)
+        val pickRow = LinearLayout(this)
+        pickRow.addView(button("Photos", true) { picker.launch("image/*") }, LinearLayout.LayoutParams(0, px(52), 1f))
+        pickRow.addView(button("Files", false) { picker.launch("*/*") }, LinearLayout.LayoutParams(0, px(52), 1f).apply { marginStart = px(8) })
+        c2.put(pickRow, 12)
         val row = LinearLayout(this)
         var firstBtn = true
         fun addBtn(t: String, f: () -> Unit) =
@@ -268,11 +292,26 @@ class MainActivity : ComponentActivity() {
         val c4 = card("Activity log")
         logView = text("", 11.5f, Neon.muted); c4.put(logView, 8)
 
+        reveal = FrameLayout(this).apply { visibility = View.GONE; setBackgroundColor(Neon.alpha(Neon.bg, 0.88f)); isClickable = true }
+        revealCard = FrameLayout(this).apply {
+            background = GradientDrawable().apply { setColor(Neon.panel); cornerRadius = px(22).toFloat(); setStroke(px(2), Neon.alpha(Neon.green, 0.9f)) }
+            setPadding(px(3), px(3), px(3), px(3))
+            outlineProvider = ViewOutlineProvider.BACKGROUND; clipToOutline = true
+        }
+        revealImg = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        revealCard.addView(revealImg, FrameLayout.LayoutParams(-1, -1))
+        reveal.addView(revealCard, FrameLayout.LayoutParams(
+            (resources.displayMetrics.widthPixels * 0.82f).toInt(), (resources.displayMetrics.heightPixels * 0.58f).toInt(), Gravity.CENTER))
+        revealCap = text("", 13f, Neon.green, true).apply { gravity = Gravity.CENTER; letterSpacing = 0.1f }
+        reveal.addView(revealCap, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = px(60) })
+        reveal.setOnClickListener { dismissReveal() }
+
         flash = View(this)
         setContentView(FrameLayout(this).apply {
             addView(GridView(this@MainActivity), FrameLayout.LayoutParams(-1, -1))
             addView(ScrollView(this@MainActivity).apply { isVerticalScrollBarEnabled = false; addView(content) }, FrameLayout.LayoutParams(-1, -1))
             addView(flash, FrameLayout.LayoutParams(-1, -1))
+            addView(reveal, FrameLayout.LayoutParams(-1, -1))
         })
         flash.alpha = 0f
 
@@ -301,6 +340,10 @@ class MainActivity : ComponentActivity() {
             orb.animate().scaleX(1.07f).scaleY(1.07f).setDuration(120)
                 .withEndAction { orb.animate().scaleX(1f).scaleY(1f).setDuration(320).start() }.start()
         }
+        if (kind == "drop") {
+            val e = Hub.history.firstOrNull { it.dir == "in" }
+            if (e != null && e.mime.startsWith("image/") && e.uri != null) showReveal(e)
+        }
     }
 
     private fun refresh() {
@@ -325,6 +368,7 @@ class MainActivity : ComponentActivity() {
         orb.devices = Hub.nearby.map { it.first }
         if (shownVersion != Hub.historyVersion) { shownVersion = Hub.historyVersion; renderHistory() }
         if (shownTrusted != Hub.trustedVersion) { shownTrusted = Hub.trustedVersion; renderTrusted() }
+        updateHero()
         orb.centerText = when {
             !running -> "OFFLINE"
             Hub.progress > 0 -> "${Hub.progress}%"
@@ -336,6 +380,54 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun isImage(n: String) = n.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "gif", "webp", "heic", "bmp")
+
+    /** Photo preview inside the orb. Pops in when you pick a photo, lifts off into the core when you grab. */
+    private fun updateHero() {
+        val first = Hub.items.firstOrNull { isImage(it.second) }?.first?.toString()
+        val want = first != null && Hub.carrying == null
+        if (want && (!heroOn || heroUri != first)) {
+            heroUri = first; heroOn = true
+            hero.setImageDrawable(null); loadThumb(first!!, hero, 600)
+            hero.animate().cancel()
+            hero.visibility = View.VISIBLE; hero.alpha = 0f; hero.scaleX = 0.6f; hero.scaleY = 0.6f; hero.rotation = 0f
+            hero.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(OvershootInterpolator(1.2f)).start()
+        } else if (!want && heroOn) {
+            heroOn = false
+            val lift = Hub.carrying != null
+            hero.animate().cancel()
+            hero.animate().scaleX(if (lift) 0.08f else 0.6f).scaleY(if (lift) 0.08f else 0.6f).alpha(0f)
+                .rotation(if (lift) 18f else 0f).setDuration(if (lift) 520L else 250L).setInterpolator(AccelerateInterpolator())
+                .withEndAction { hero.visibility = View.GONE }.start()
+        }
+    }
+
+    /** Full-screen photo that flies in when a picture arrives. Tap to dismiss (also closes after 8 s). */
+    private fun showReveal(e: Hub.Entry) {
+        val u = e.uri ?: return
+        val id = ++revealId
+        revealImg.setImageDrawable(null)
+        loadThumb(u, revealImg, 1400)
+        revealCap.text = "RECEIVED  ·  " + e.name + (if (e.peer.isNotBlank()) "  ·  from " + e.peer else "")
+        reveal.animate().cancel(); reveal.visibility = View.VISIBLE; reveal.alpha = 0f
+        reveal.animate().alpha(1f).setDuration(250).start()
+        revealCard.animate().cancel()
+        revealCard.alpha = 0f; revealCard.scaleX = 0.15f; revealCard.scaleY = 0.15f; revealCard.rotation = -14f
+        revealCard.translationY = -resources.displayMetrics.heightPixels * 0.35f
+        revealCard.animate().alpha(1f).scaleX(1f).scaleY(1f).rotation(0f).translationY(0f)
+            .setDuration(600).setInterpolator(OvershootInterpolator(0.9f)).start()
+        revealCap.alpha = 0f
+        revealCap.animate().alpha(1f).setStartDelay(350).setDuration(300).start()
+        reveal.postDelayed({ if (id == revealId) dismissReveal() }, 8000)
+    }
+
+    private fun dismissReveal() {
+        if (reveal.visibility != View.VISIBLE) return
+        revealId++
+        revealCard.animate().alpha(0f).scaleX(0.85f).scaleY(0.85f).setDuration(220).start()
+        reveal.animate().alpha(0f).setDuration(260).withEndAction { reveal.visibility = View.GONE }.start()
+    }
+
     private fun timeText(ms: Long): String = SimpleDateFormat("d MMM, HH:mm", Locale.getDefault()).format(Date(ms))
 
     private fun openFile(e: Hub.Entry) {
@@ -345,19 +437,29 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { Hub.say("No app found to open " + e.name) }
     }
 
-    /** Small thumbnail, decoded off the UI thread. */
-    private fun loadThumb(uri: String, iv: ImageView) {
-        thumbCache[uri]?.let { iv.setImageBitmap(it); return }
+    /** Bitmap decoded off the UI thread, sampled to about `max` px and rotated by its EXIF orientation. */
+    private fun loadThumb(uri: String, iv: ImageView, max: Int = 240) {
+        val key = "$uri#$max"
+        thumbCache[key]?.let { iv.setImageBitmap(it); return }
         thread {
             try {
                 val u = Uri.parse(uri)
                 val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o) }
                 var s = 1
-                while (o.outWidth / s > 240 && o.outHeight / s > 240) s *= 2
+                while (o.outWidth / s > max && o.outHeight / s > max) s *= 2
                 val o2 = BitmapFactory.Options().apply { inSampleSize = s }
-                val bmp = contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o2) }
-                if (bmp != null) { thumbCache[uri] = bmp; runOnUiThread { iv.setImageBitmap(bmp) } }
+                val raw = contentResolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, o2) }
+                val orient = try {
+                    contentResolver.openInputStream(u)?.use { android.media.ExifInterface(it).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1) } ?: 1
+                } catch (_: Exception) { 1 }
+                val deg = when (orient) { 6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f }
+                val bmp = if (raw != null && deg != 0f)
+                    Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, android.graphics.Matrix().apply { postRotate(deg) }, true) else raw
+                if (bmp != null) {
+                    if (max <= 600) thumbCache[key] = bmp
+                    runOnUiThread { iv.setImageBitmap(bmp) }
+                }
             } catch (_: Exception) {}
         }
     }
